@@ -136,3 +136,35 @@ Stocks:
     return df_sectors
 
 
+# --------------------------
+# Updates stock list in the database
+# --------------------------
+def database_update():
+    
+    # --- Connect to PostgreSQL ---
+    engine = get_db_engine()
+
+    # --- Read your stocks from the URL ---
+    url = "https://api.kite.trade/instruments"
+    df = pd.read_csv(url)
+
+    # Keeping only the tradeable stocks
+    df = df[df['exchange'] == 'NSE']
+    df = df[~df['tradingsymbol'].str.match(r'^\d.*-.{2}$')]
+    df = df[df['segment'] == 'NSE']
+
+    df['Date_Update'] = datetime.now().date()
+    cols_sel = ['Date_Update', 'instrument_token', 'exchange_token', 'tradingsymbol', 'name', 'instrument_type', 'segment', 'exchange']
+
+    df = df[cols_sel]
+
+    # --- Upload to database ---
+    df.to_sql(
+        'stock_list',
+        engine,
+        if_exists = 'replace',
+        index = False,
+        dtype={'date_update': Date()}
+    )
+
+    print("✅ Successfully uploaded stocklist to PostgreSQL!")
