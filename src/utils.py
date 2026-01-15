@@ -14,7 +14,7 @@ import traceback
 
 # Third-party libraries
 import numpy as np
-import openai
+from openai import OpenAI
 import pandas as pd
 import pytz
 from dateutil.relativedelta import relativedelta
@@ -46,7 +46,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 API_KEY = os.getenv("KITE_API_KEY", None)
 API_SECRET = os.getenv("KITE_API_SECRET", None)
 ACCESS_TOKEN = os.getenv("KITE_ACCESS_TOKEN", None)
-openai.api_key = OPENAI_API_KEY
+client = OpenAI()
 
 # --------------------------
 # Database connection
@@ -113,13 +113,13 @@ Stocks:
             name = row['name'] if row['name'] else row['tradingsymbol']
             prompt += f"{row['tradingsymbol']} - {name}\n"
 
-        response = openai.ChatCompletion.create(
+        response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
             temperature=0
         )
 
-        llm_text = response['choices'][0]['message']['content']
+        llm_text = response.choices[0].message.content
 
         # Extract JSON array from the model reply
         match = re.search(r"\[\s*{.*}\s*\]", llm_text, re.DOTALL)
