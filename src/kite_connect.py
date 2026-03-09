@@ -6,7 +6,7 @@ from pathlib import Path
 import pandas as pd
 
 # Load .env from project root
-project_root = Path(__file__).resolve().parent.parent
+project_root = Path(os.getcwd()).resolve()
 env_path = project_root / ".env"
 load_dotenv(dotenv_path=env_path)
 
