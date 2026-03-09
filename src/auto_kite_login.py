@@ -12,11 +12,17 @@ from selenium.webdriver.support import expected_conditions as EC
 from urllib.parse import urlparse, parse_qs
 import time
 import pyotp
+from azure.identity import DefaultAzureCredential
+from azure.keyvault.secrets import SecretClient
 
 # Load .env from project root
-project_root = Path(__file__).resolve().parent.parent
+project_root = Path(os.getcwd()).resolve()
 env_path = project_root / ".env"
 load_dotenv(dotenv_path=env_path)
+
+key_vault_url = "https://stocks-zerodha.vault.azure.net/"
+credential = DefaultAzureCredential()
+client = SecretClient(vault_url=key_vault_url, credential=credential)
 
 logging.basicConfig(level=logging.INFO)
 
@@ -38,16 +44,21 @@ class ZerodhaConnector:
 
     def generate_access_token(self, api_secret: str):
         """Automatically log in using Selenium and generate access token with TOTP."""
-        USER_ID = os.getenv("ZERODHA_USERID")
-        PASSWORD = os.getenv("ZERODHA_PASSWORD")
-        TOTP_SECRET = os.getenv("ZERODHA_SECRET_TOTP")
+        USER_ID = client.get_secret("ZERODHA-USERID").value
+        PASSWORD = client.get_secret("ZERODHA-PASSWORD").value
+        TOTP_SECRET = client.get_secret("ZERODHA-SECRET-TOTP").value
 
         if not all([USER_ID, PASSWORD, TOTP_SECRET]):
-            raise ValueError("ZERODHA_USERID, ZERODHA_PASSWORD, and ZERODHA_SECRET_TOTP must be set in .env")
+            raise ValueError("ZERODHA-USERID, ZERODHA-PASSWORD, and ZERODHA-SECRET-TOTP must be in the vault.")
 
         options = webdriver.ChromeOptions()
         options.add_argument("--start-maximized")
         options.add_argument("--headless")
+        options.add_argument("--headless=new")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--window-size=1920,1080")
         driver = webdriver.Chrome(options=options)
         wait = WebDriverWait(driver, 30)
 
@@ -97,8 +108,8 @@ class ZerodhaConnector:
             data = self.kite.generate_session(request_token, api_secret=api_secret)
             self.access_token = data["access_token"]
             self.kite.set_access_token(self.access_token)
-            set_key(str(env_path), "KITE_ACCESS_TOKEN", self.access_token)
-            logging.info("Access token generated and saved to .env.")
+            set_key(str(env_path), "KITE-ACCESS-TOKEN", self.access_token)
+            logging.info("Access token generated.")
 
             return self.access_token
 
@@ -111,7 +122,7 @@ class ZerodhaConnector:
             return func(*args, **kwargs)
         except TokenException:
             logging.warning("Access token expired. Regenerating token...")
-            self.generate_access_token(os.getenv("KITE_API_SECRET"))
+            self.generate_access_token(client.get_secret("KITE-API-SECRET").value)
             return func(*args, **kwargs)
 
     def get_profile(self):
@@ -146,9 +157,9 @@ class ZerodhaConnector:
 
 
 if __name__ == "__main__":
-    API_KEY = os.getenv("KITE_API_KEY")
-    API_SECRET = os.getenv("KITE_API_SECRET")
-    ACCESS_TOKEN = os.getenv("KITE_ACCESS_TOKEN")
+    API_KEY = client.get_secret("KITE-API-KEY").value
+    API_SECRET = client.get_secret("KITE-API-SECRET").value
+    ACCESS_TOKEN = client.get_secret("KITE-ACCESS-TOKEN").value
 
     kite_client = ZerodhaConnector(API_KEY, ACCESS_TOKEN)
 
