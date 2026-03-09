@@ -11,6 +11,7 @@ import time
 from datetime import datetime, date, timedelta, time as dt_time
 from pathlib import Path
 import traceback
+import requests
 
 # Third-party libraries
 import numpy as np
@@ -27,7 +28,11 @@ from kiteconnect.exceptions import InputException
 from sqlalchemy import (
     Table, Column, Integer, String, Boolean, DateTime, MetaData, create_engine, Date, select
 )
+from azure.identity import DefaultAzureCredential
+from azure.keyvault.secrets import SecretClient
 
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import current_timestamp, lit, col
 
 
 # --------------------------
@@ -37,157 +42,34 @@ project_root = Path.cwd().parent
 env_path = project_root / ".env"
 load_dotenv(dotenv_path=env_path, override=True)
 
-DB_USER = os.getenv("POSTGRES_USER")
-DB_PASSWORD = os.getenv("POSTGRES_PASSWORD")
-DB_HOST = os.getenv("POSTGRES_HOST", "localhost")
-DB_PORT = os.getenv("POSTGRES_PORT", "5432")
-DB_NAME = os.getenv("POSTGRES_DB", "market")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-API_KEY = os.getenv("KITE_API_KEY", None)
-API_SECRET = os.getenv("KITE_API_SECRET", None)
-ACCESS_TOKEN = os.getenv("KITE_ACCESS_TOKEN", None)
-client = OpenAI()
+key_vault_url = "https://stocks-zerodha.vault.azure.net/"
+credential = DefaultAzureCredential()
+client = SecretClient(vault_url=key_vault_url, credential=credential)
+
+DB_USER = client.get_secret("POSTGRES-AZURE-USER").value
+DB_PASSWORD = client.get_secret("POSTGRES-AZURE-PASSWORD").value
+DB_SERVER = "databricks-zerodha"
+DB_HOST = "databricks-zerodha.postgres.database.azure.com"
+DB_PORT = "5432"
+DB_NAME = "market"
+OPENAI_API_KEY = client.get_secret("OPENAI-API-KEY").value
+API_KEY = client.get_secret("KITE-API-KEY").value
+API_SECRET = client.get_secret("KITE-API-SECRET").value
+ACCESS_TOKEN = os.getenv("KITE-ACCESS-TOKEN", None)
+client_openai = OpenAI(api_key=OPENAI_API_KEY)
+pushover_api_token = client.get_secret("pushover-api-token").value
+pushover_userkey = client.get_secret("pushover-userkey").value
 
 # --------------------------
 # Database connection
 # --------------------------
 def get_db_engine():
-    return create_engine(f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}")
-
-# --------------------------
-# Incremental stock sector classification
-# --------------------------
-def classify_new_stocks_to_sectors(batch_size: int = 100, allowed_sectors: list = None):
-    """
-    Incrementally classify stocks into sectors using OpenAI LLM.
-    Only new stocks not yet in 'stock_sectors' table are classified and uploaded.
-    """
-    if allowed_sectors is None:
-        allowed_sectors = [
-            "Agriculture", "Automobile", "Carbon Products", "Cement", "Ceramics", "Chemicals",
-            "Construction", "Consumer Products", "Defense", "Diversified", "Education", "Electricals",
-            "Energy", "Entertainment", "Environmental Services", "Financial Services", "Food & Beverage",
-            "Healthcare", "Hospitality", "Industrial Equipment", "Jewelry", "Logistics", "Manufacturing",
-            "Metals", "Paper", "Plastics", "Real Estate", "Retail", "Rubber", "Shipping", "Technology",
-            "Telecommunications", "Textiles", "Trading"
-        ]
-
-    engine = get_db_engine()
-    stock_list = pd.read_sql("SELECT * FROM stock_list", engine)
-
-    # Load existing sectors
-    try:
-        existing_sectors = pd.read_sql("SELECT tradingsymbol FROM stock_sectors", engine)
-        existing_symbols = set(existing_sectors['tradingsymbol'].tolist())
-    except Exception:
-        existing_symbols = set()
-
-    # Find new stocks
-    new_stocks = stock_list[~stock_list['tradingsymbol'].isin(existing_symbols)]
-    if new_stocks.empty:
-        print("No new stocks to classify.")
-        return pd.DataFrame()  # nothing to do
-
-    df_stocks = new_stocks.copy()
-    sectors_result = []
-
-    sector_list_str = ", ".join(allowed_sectors)
-
-    for i in range(0, len(df_stocks), batch_size):
-        batch = df_stocks.iloc[i:i + batch_size]
-
-        prompt = f"""
-Assign exactly one sector to each of the following stocks.
-Choose the sector ONLY from this allowed list (do not invent new sectors):
-
-{sector_list_str}
-
-Return the output strictly as a JSON array of objects with fields:
-- tradingsymbol
-- name
-- sector
-
-Stocks:
-"""
-        for _, row in batch.iterrows():
-            name = row['name'] if row['name'] else row['tradingsymbol']
-            prompt += f"{row['tradingsymbol']} - {name}\n"
-
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0
-        )
-
-        llm_text = response.choices[0].message.content
-
-        # Extract JSON array from the model reply
-        match = re.search(r"\[\s*{.*}\s*\]", llm_text, re.DOTALL)
-        if match:
-            try:
-                batch_sectors = json.loads(match.group())
-                sectors_result.extend(batch_sectors)
-            except json.JSONDecodeError as e:
-                print(f"Error decoding JSON in batch {i}-{i + batch_size}: {e}")
-                print("LLM response:", llm_text)
-        else:
-            print(f"No JSON found in batch {i}-{i + batch_size}")
-        
-        time.sleep(1)  # avoid rate limit
-
-    # Convert result to DataFrame
-    df_sectors = pd.DataFrame(sectors_result)
-    df_sectors['Date_Update'] = datetime.now().date()
-    cols = ['Date_Update'] + [c for c in df_sectors.columns if c != 'Date_Update']
-    stocktypes = df_sectors[cols]
-
-    # Append new sectors to database
-    stocktypes.to_sql(
-        'stock_sectors',
-        engine,
-        if_exists='append',  # append instead of replace
-        index=False,
-        dtype={'Date_Update': Date()}
+    return create_engine(
+        f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}",
+        connect_args={"sslmode": "require"}
     )
 
-    print(f"Classified and uploaded {len(df_sectors)} new stocks.")
-    return df_sectors
 
-
-# --------------------------
-# Updates stock list in the database
-# --------------------------
-def database_update():
-    
-    # --- Connect to PostgreSQL ---
-    engine = get_db_engine()
-
-    # --- Read your stocks from the URL ---
-    url = "https://api.kite.trade/instruments"
-    df = pd.read_csv(url)
-
-    # Keeping only the tradeable stocks
-    df = df[df['exchange'] == 'NSE']
-    df = df[~df['tradingsymbol'].str.match(r'^\d.*-.{2}$')]
-    df = df[df['segment'] == 'NSE']
-
-    df['Date_Update'] = datetime.now().date()
-    cols_sel = ['Date_Update', 'instrument_token', 'exchange_token', 'tradingsymbol', 'name', 'instrument_type', 'segment', 'exchange']
-
-    df = df[cols_sel]
-
-    # --- Upload to database ---
-    df.to_sql(
-        'stock_list',
-        engine,
-        if_exists = 'replace',
-        index = False,
-        dtype={'date_update': Date()}
-    )
-
-    print("✅ Successfully uploaded stocklist to PostgreSQL!")
-    
-    
 # --------------------------
 # Check if market is open
 # --------------------------
@@ -290,7 +172,7 @@ def score_stock(df, latest_row):
     
     # 2. Volatility
     vol = latest_row['volatility_1m']
-    if 0.02 <= vol <= 0.08:  # example range for “moderate” volatility
+    if 0.02 <= vol <= 0.08:  # example range for "moderate" volatility
         score += 10
     
     # 3. Momentum
@@ -324,267 +206,6 @@ def get_last_saved_date(symbol, engine):
     """
     df = pd.read_sql(query, engine)
     return df['max_date'][0]
-
-def update_stock_timeseries_db():
-
-    engine = get_db_engine()
-
-    # Load stock list
-    stock_list = pd.read_sql("SELECT * FROM stock_list", engine)
-
-    # load_dotenv(dotenv_path=env_path, override=True)
-    # API_KEY = os.getenv("KITE_API_KEY")
-    # ACCESS_TOKEN = os.getenv("KITE_ACCESS_TOKEN", None)
-    # print(ACCESS_TOKEN)
-    
-    kite_client = ZerodhaConnector(API_KEY, ACCESS_TOKEN)
-    kite = kite_client.kite
-
-    to_date = datetime.now().date()
-    from_date_default = to_date - relativedelta(months=3)
-
-    # Check if this is the first time stock_timeseries is used
-    try:
-        existing_symbols = pd.read_sql(
-            "SELECT DISTINCT tradingsymbol FROM stock_timeseries LIMIT 1", 
-            engine
-        )
-        first_time = False
-    except Exception as e:
-        # Table doesn't exist → first time update
-        print("⚠️ stock_timeseries does not exist. Running full initial load.")
-        first_time = True
-
-    # Loop over stocks
-    for _, stock in tqdm(stock_list.iterrows(), total=len(stock_list), desc="Updating Stocks"):
-
-        symbol = stock['tradingsymbol']
-
-        # Case 1: First time update → load full 3 months
-        if first_time:
-            from_date = from_date_default
-
-        # Case 2: Table exists → use last saved date
-        else:
-            last_saved = get_last_saved_date(symbol, engine)
-
-            if last_saved is not None:
-                last_saved = pd.to_datetime(last_saved).date()
-
-                if last_saved >= to_date:
-                    # Already up-to-date
-                    continue
-
-                from_date = last_saved + timedelta(days=1)
-            else:
-                # Symbol does not exist in table → get default 3 months
-                from_date = from_date_default
-                
-        # Fetch data from Zerodha
-        df = fetch_ohlcv_from_zerodha(symbol, from_date, to_date, "day", "NSE", kite)
-        df = df.reset_index(drop=True)
-
-        if not df.empty:
-            df['tradingsymbol'] = symbol
-
-            df.to_sql(
-                'stock_timeseries',
-                engine,
-                if_exists='append',
-                index=False,
-                dtype={'date': Date()}
-            )
-
-def update_stock_scores_db():
-    engine = get_db_engine()
-
-    # --------------------------
-    # Load stock list
-    # --------------------------
-    stock_list = pd.read_sql("SELECT * FROM stock_list", engine)
-    if stock_list.empty:
-        print("⚠️ No stocks found in stock_list.")
-        return
-
-    results = []
-    to_date = datetime.now().date()
-
-    # --------------------------
-    # Loop over each stock
-    # --------------------------
-    for _, stock in tqdm(stock_list.iterrows(), total=len(stock_list), desc="Scoring Stocks"):
-        symbol = stock['tradingsymbol']
-
-        # Load full OHLCV history for this stock
-        df = pd.read_sql(
-            "SELECT * FROM stock_timeseries WHERE tradingsymbol = %s ORDER BY date",
-            engine,
-            params=(symbol,)
-        )
-
-
-        if df.empty or len(df) < 2:
-            # Not enough data to compute indicators/score
-            continue
-
-        # Compute technical indicators
-        df_indicators = compute_indicators(df)
-
-        # Take the latest row for scoring
-        latest_row = df_indicators.iloc[-1]
-
-        # Compute score
-        score = score_stock(df_indicators, latest_row)
-
-        results.append({
-            "Date_Update": to_date,
-            "tradingsymbol": symbol,
-            "score": score,
-            "latest_close": latest_row["close"]
-        })
-
-    # --------------------------
-    # Save scores to database
-    # --------------------------
-    if results:
-        df_scores = pd.DataFrame(results)
-        df_scores['score'] = df_scores['score'].round(2)
-        df_scores['latest_close'] = df_scores['latest_close'].round(2)
-        cols_sel = ['Date_Update'] + [c for c in df_scores.columns if c != 'Date_Update']
-        df_scores = df_scores[cols_sel]
-
-        df_scores.to_sql(
-            "stock_scores",
-            engine,
-            if_exists="append",
-            index=False,
-            dtype={'Date_Update': Date()}
-        )
-
-        print(f"✅ Saved {len(df_scores)} stock scores.")
-    else:
-        print("⚠️ No scores calculated.")
-        
-        
-        
-def select_top_stocks(top_n=10, price_limit=200, correlation_threshold=0.6):
-    """
-    Select top stocks based on score, sector diversification, price limit, and correlation filter.
-    
-    Saves the final selection to the 'stock_short_buy' table.
-    """
-    engine = get_db_engine()
-
-    # --------------------------
-    # Load necessary data
-    # --------------------------
-    stock_list = pd.read_sql("SELECT * FROM stock_list", engine)
-    df_sectors = pd.read_sql("SELECT * FROM stock_sectors", engine)
-    
-    ranked_stocks = pd.read_sql("""
-        SELECT *
-        FROM stock_scores
-        WHERE "Date_Update" = (
-            SELECT MAX("Date_Update") FROM stock_scores
-        )
-    """, engine)
-    
-    # Merge stock names and sector info
-    ranked_stocks = ranked_stocks.merge(df_sectors[['tradingsymbol', 'sector']],
-                                        on='tradingsymbol', how='left')
-    ranked_stocks = ranked_stocks.merge(stock_list[['tradingsymbol', 'name']],
-                                        on='tradingsymbol', how='left')
-    
-    # Filter by price limit
-    ranked_stocks_sub = ranked_stocks[ranked_stocks['latest_close'] <= price_limit]
-
-    selected_stocks = []
-    selected_sectors = set()
-
-    # --------------------------
-    # Select stocks based on score, sector, and correlation
-    # --------------------------
-    for _, row in ranked_stocks_sub.sort_values('score', ascending=False).iterrows():
-        stock = row['tradingsymbol']
-        sector = row['sector']
-
-        # Skip if sector already selected (optional: uncomment if strict sector diversification)
-        # if sector in selected_sectors:
-        #     continue
-
-        # Load historical closes
-        df_stock = pd.read_sql(f"""
-            SELECT date, close
-            FROM stock_indicators
-            WHERE tradingsymbol = '{stock}'
-            ORDER BY date
-        """, engine, parse_dates=['date'])
-
-        if df_stock.empty:
-            continue
-
-        stock_returns = df_stock['close'].pct_change().dropna()
-        skip = False
-
-        # Check correlation with already selected stocks
-        for sel_stock in selected_stocks:
-            sel_df = pd.read_sql(f"""
-                SELECT date, close
-                FROM stock_indicators
-                WHERE tradingsymbol = '{sel_stock}'
-                ORDER BY date
-            """, engine, parse_dates=['date'])
-            sel_returns = sel_df['close'].pct_change().dropna()
-
-            combined = pd.concat([stock_returns, sel_returns], axis=1, join='inner')
-            if combined.shape[0] == 0:
-                continue
-
-            corr = combined.iloc[:, 0].corr(combined.iloc[:, 1])
-            if abs(corr) >= correlation_threshold:
-                print(f"Skipping {stock}, correlation with {sel_stock} = {corr:.2f}")
-                skip = True
-                break
-
-        if skip:
-            continue
-
-        # Add to selection
-        selected_stocks.append(stock)
-        selected_sectors.add(sector)  # optional
-
-        if len(selected_stocks) >= top_n:
-            break
-
-    print("Selected stocks:", selected_stocks)
-
-    # --------------------------
-    # Prepare final DataFrame
-    # --------------------------
-    final_stocks = ranked_stocks_sub[ranked_stocks_sub['tradingsymbol'].isin(selected_stocks)]
-    top_stocks = final_stocks[['tradingsymbol', 'score', 'sector', 'latest_close']].copy()
-    
-    # Round numeric columns
-    top_stocks['score'] = top_stocks['score'].round(2)
-    top_stocks['latest_close'] = top_stocks['latest_close'].round(2)
-
-    # Add update date
-    top_stocks['Date_Update'] = datetime.now().date()
-    cols = ['Date_Update'] + [c for c in top_stocks.columns if c != 'Date_Update']
-    top_stocks = top_stocks[cols]
-
-    # --------------------------
-    # Save to database
-    # --------------------------
-    top_stocks.to_sql(
-        'stock_short_buy',
-        engine,
-        if_exists='append',
-        index=False,
-        dtype={'Date_Update': Date()}
-    )
-
-    return top_stocks
 
 
 def get_recent_news_sentiment(stock_name, max_articles=50):
@@ -865,3 +486,503 @@ def process_and_store_intended_orders(top_stocks, amo_flag=True):
             conn.commit()
 
     print("✔ All intended orders processed and stored (duplicates skipped, exceptions captured).")
+
+
+# --------------------------
+# Updates stock list in the database
+# --------------------------
+def database_update():
+    """
+    Fetch latest stock list from Kite API and write to Bronze Delta table in Unity Catalog
+    """
+    # -----------------------------
+    # 1. Fetch stock data from Kite API
+    # -----------------------------
+    url = "https://api.kite.trade/instruments"
+    df = pd.read_csv(url)
+
+    # Keep only tradeable NSE stocks
+    df = df[df['exchange'] == 'NSE']
+    df = df[~df['tradingsymbol'].str.match(r'^\d.*-.{2}$')]
+    df = df[df['segment'] == 'NSE']
+
+    # Add update timestamp
+    df['date_update'] = datetime.now().date()
+
+    # Select relevant columns
+    cols_sel = ['date_update', 'instrument_token', 'exchange_token', 'tradingsymbol',
+                'name', 'instrument_type', 'segment', 'exchange']
+    df = df[cols_sel]
+
+    # -----------------------------
+    # 2. Convert to Spark DataFrame
+    # -----------------------------
+    spark_df = SparkSession.builder.getOrCreate().createDataFrame(df)
+
+    # Optional: add ingestion timestamp for Bronze layer
+    spark_df = spark_df.withColumn("ingestion_ts", current_timestamp())
+
+    # -----------------------------
+    # 3. Write to Bronze Delta table
+    # -----------------------------
+    bronze_table = "stock_catalog.bronze.stock_list"
+
+    spark_df.write.format("delta").mode("overwrite").saveAsTable(bronze_table)
+
+    print(f"✅ Successfully uploaded stock list to Bronze Delta table: {bronze_table}")
+
+
+def update_stock_timeseries_db():
+    """
+    Fetch OHLCV from Zerodha and write raw data to Bronze Delta table,
+    preserving first-time vs incremental update logic.
+    """
+    spark = SparkSession.builder.getOrCreate()
+    
+    # Load stock list from Bronze
+    df_stock_list = spark.table("stock_catalog.bronze.stock_list")
+    stock_list = df_stock_list.toPandas()
+    
+    kite_client = ZerodhaConnector(API_KEY, ACCESS_TOKEN)
+    kite = kite_client.kite
+
+    to_date = datetime.now().date()
+    from_date_default = to_date - relativedelta(months=60)
+
+    bronze_table = "stock_catalog.bronze.stock_timeseries"
+
+    # Check if Bronze table exists
+    try:
+        df_existing = spark.table(bronze_table)
+        first_time = False
+    except Exception:
+        print("⚠️ Bronze stock_timeseries table does not exist. Running full initial load.")
+        first_time = True
+        df_existing = None
+
+    all_data = []
+
+    for _, stock in tqdm(stock_list.iterrows(), total=len(stock_list), desc="Updating Stocks"):
+        symbol = stock['tradingsymbol']
+
+        # Determine from_date
+        if first_time:
+            from_date = from_date_default
+        else:
+            # Check last saved date for this symbol
+            df_symbol = df_existing.filter(col("tradingsymbol") == symbol).select("date")
+            if df_symbol.count() > 0:
+                last_saved = df_symbol.agg({"date": "max"}).collect()[0][0]
+                last_saved = last_saved.date() if isinstance(last_saved, datetime) else last_saved
+                if last_saved >= to_date:
+                    # Already up-to-date
+                    continue
+                from_date = last_saved + timedelta(days=1)
+            else:
+                from_date = from_date_default
+
+        # Fetch raw OHLCV
+        df = fetch_ohlcv_from_zerodha(symbol, from_date, to_date, "day", "NSE", kite)
+        if not df.empty:
+            df['tradingsymbol'] = symbol
+            df['ingestion_ts'] = datetime.now()
+            all_data.append(df)
+
+    # Write to Bronze Delta
+    if all_data:
+        df_combined = pd.concat(all_data, ignore_index=True)
+        spark_df = spark.createDataFrame(df_combined)
+
+        spark_df.write.format("delta") \
+            .mode("append") \
+            .saveAsTable(bronze_table)
+
+        print(f"✅ Successfully updated Bronze stock_timeseries: {bronze_table}")
+    else:
+        print("ℹ️ No new data to update.")
+
+def update_stock_scores_db():
+    """
+    Compute stock scores from Bronze tables and write to Silver Delta table
+    """
+    spark = SparkSession.builder.getOrCreate()
+    to_date = datetime.now().date()
+
+    # -----------------------------
+    # 1. Load stock list from Bronze
+    # -----------------------------
+    df_stock_list = spark.table("stock_catalog.bronze.stock_list").toPandas()
+    if df_stock_list.empty:
+        print("⚠️ No stocks found in stock_list.")
+        return
+
+    results = []
+
+    # -----------------------------
+    # 2. Loop over each stock
+    # -----------------------------
+    for _, stock in tqdm(df_stock_list.iterrows(), total=len(df_stock_list), desc="Scoring Stocks"):
+        symbol = stock['tradingsymbol']
+
+        # Load full OHLCV history from Bronze
+        df_ts = spark.table("stock_catalog.bronze.stock_timeseries") \
+                     .filter(col("tradingsymbol") == symbol) \
+                     .orderBy("date") \
+                     .toPandas()
+
+        if df_ts.empty or len(df_ts) < 2:
+            continue
+
+        # Compute technical indicators
+        df_indicators = compute_indicators(df_ts)
+
+        # Take latest row for scoring
+        latest_row = df_indicators.iloc[-1]
+
+        # Compute score
+        score = score_stock(df_indicators, latest_row)
+
+        results.append({
+            "date_update": to_date,
+            "tradingsymbol": symbol,
+            "score": round(score, 2),
+            "latest_close": round(latest_row["close"], 2)
+        })
+
+    # -----------------------------
+    # 3. Write results to Silver Delta
+    # -----------------------------
+    if results:
+        df_scores = pd.DataFrame(results)
+        spark_df = spark.createDataFrame(df_scores)
+
+        silver_table = "stock_catalog.silver.stock_scores"
+
+        spark_df.write.format("delta") \
+            .mode("append") \
+            .saveAsTable(silver_table)
+
+        print(f"✅ Saved {len(df_scores)} stock scores to Silver: {silver_table}")
+    else:
+        print("⚠️ No scores calculated.")
+
+
+# --------------------------
+# Incremental stock sector classification
+# --------------------------
+def classify_new_stocks_to_sectors(batch_size: int = 100, allowed_sectors: list = None):
+    """
+    Incrementally classify new stocks into sectors using OpenAI LLM
+    and write results to Silver Delta table.
+    """
+    if allowed_sectors is None:
+        allowed_sectors = [
+            "Agriculture", "Automobile", "Carbon Products", "Cement", "Ceramics", "Chemicals",
+            "Construction", "Consumer Products", "Defense", "Diversified", "Education", "Electricals",
+            "Energy", "Entertainment", "Environmental Services", "Financial Services", "Food & Beverage",
+            "Healthcare", "Hospitality", "Industrial Equipment", "Jewelry", "Logistics", "Manufacturing",
+            "Metals", "Paper", "Plastics", "Real Estate", "Retail", "Rubber", "Shipping", "Technology",
+            "Telecommunications", "Textiles", "Trading"
+        ]
+
+    spark = SparkSession.builder.getOrCreate()
+    
+    # -----------------------------
+    # 1. Load stock list from Bronze
+    # -----------------------------
+    df_stock_list = spark.table("stock_catalog.bronze.stock_list").toPandas()
+    if df_stock_list.empty:
+        print("⚠️ No stocks found in stock_list.")
+        return pd.DataFrame()
+
+    # -----------------------------
+    # 2. Load existing sectors from Silver
+    # -----------------------------
+    try:
+        df_existing = spark.table("stock_catalog.silver.stock_sectors").toPandas()
+        existing_symbols = set(df_existing['tradingsymbol'].tolist())
+    except Exception:
+        existing_symbols = set()
+
+    # -----------------------------
+    # 3. Find new stocks
+    # -----------------------------
+    new_stocks = df_stock_list[~df_stock_list['tradingsymbol'].isin(existing_symbols)]
+    if new_stocks.empty:
+        print("No new stocks to classify.")
+        return pd.DataFrame()
+
+    df_stocks = new_stocks.copy()
+    sectors_result = []
+    sector_list_str = ", ".join(allowed_sectors)
+
+    # -----------------------------
+    # 4. Classify in batches using LLM
+    # -----------------------------
+    for i in range(0, len(df_stocks), batch_size):
+        batch = df_stocks.iloc[i:i + batch_size]
+
+        prompt = f"""
+Assign exactly one sector to each of the following stocks.
+Choose the sector ONLY from this allowed list (do not invent new sectors):
+
+{sector_list_str}
+
+Return the output strictly as a JSON array of objects with fields:
+- tradingsymbol
+- name
+- sector
+
+Stocks:
+"""
+        for _, row in batch.iterrows():
+            name = row['name'] if row['name'] else row['tradingsymbol']
+            prompt += f"{row['tradingsymbol']} - {name}\n"
+
+        response = client_openai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0
+        )
+
+        llm_text = response.choices[0].message.content
+
+        # Extract JSON array from LLM response
+        match = re.search(r"\[\s*{.*}\s*\]", llm_text, re.DOTALL)
+        if match:
+            try:
+                batch_sectors = json.loads(match.group())
+                sectors_result.extend(batch_sectors)
+            except json.JSONDecodeError as e:
+                print(f"Error decoding JSON in batch {i}-{i + batch_size}: {e}")
+                print("LLM response:", llm_text)
+        else:
+            print(f"No JSON found in batch {i}-{i + batch_size}")
+        
+        time.sleep(1)  # avoid rate limit
+
+    # -----------------------------
+    # 5. Convert result to DataFrame
+    # -----------------------------
+    if sectors_result:
+        df_sectors = pd.DataFrame(sectors_result)
+        df_sectors['date_update'] = datetime.now().date()
+        cols = ['date_update'] + [c for c in df_sectors.columns if c != 'date_update']
+        df_sectors = df_sectors[cols]
+
+        # -----------------------------
+        # 6. Write to Silver Delta
+        # -----------------------------
+        spark_df = spark.createDataFrame(df_sectors)
+        silver_table = "stock_catalog.silver.stock_sectors"
+
+        spark_df.write.format("delta") \
+            .mode("append") \
+            .saveAsTable(silver_table)
+
+        print(f"✅ Classified and uploaded {len(df_sectors)} new stocks to Silver: {silver_table}")
+        return df_sectors
+    else:
+        print("⚠️ No sectors classified.")
+        return pd.DataFrame()
+
+
+def select_top_stocks(top_n=10, price_limit=200, correlation_threshold=0.6):
+    """
+    Select top stocks based on score, sector diversification, price limit, and correlation filter.
+    Writes final selection to Gold Delta table.
+    """
+    spark = SparkSession.builder.getOrCreate()
+
+    # --------------------------
+    # Load data from Bronze / Silver
+    # --------------------------
+    stock_list = spark.table("stock_catalog.bronze.stock_list").toPandas()
+    df_sectors = spark.table("stock_catalog.silver.stock_sectors").toPandas()
+    ranked_stocks = spark.table("stock_catalog.silver.stock_scores").toPandas()
+
+    # Take latest scores only
+    latest_date = ranked_stocks['date_update'].max()
+    ranked_stocks = ranked_stocks[ranked_stocks['date_update'] == latest_date]
+
+    # Merge stock names and sector info
+    ranked_stocks = ranked_stocks.merge(df_sectors[['tradingsymbol', 'sector']],
+                                        on='tradingsymbol', how='left')
+    ranked_stocks = ranked_stocks.merge(stock_list[['tradingsymbol', 'name']],
+                                        on='tradingsymbol', how='left')
+
+    # Filter by price
+    ranked_stocks = ranked_stocks[ranked_stocks['latest_close'] <= price_limit]
+
+    selected_stocks = []
+    selected_sectors = set()
+
+    # --------------------------
+    # Select top N with correlation filter
+    # --------------------------
+    for _, row in ranked_stocks.sort_values('score', ascending=False).iterrows():
+        stock = row['tradingsymbol']
+        sector = row['sector']
+
+        # Load historical closes from Bronze timeseries
+        df_stock = spark.table("stock_catalog.bronze.stock_timeseries") \
+                        .filter(col("tradingsymbol") == stock) \
+                        .toPandas().sort_values("date")
+        if df_stock.empty:
+            continue
+
+        stock_returns = df_stock['close'].pct_change().dropna()
+        skip = False
+
+        # Check correlation with already selected stocks
+        for sel_stock in selected_stocks:
+            sel_df = spark.table("stock_catalog.bronze.stock_timeseries") \
+                          .filter(col("tradingsymbol") == sel_stock) \
+                          .toPandas().sort_values("date")
+            sel_returns = sel_df['close'].pct_change().dropna()
+            combined = pd.concat([stock_returns, sel_returns], axis=1, join='inner')
+            if combined.shape[0] == 0:
+                continue
+            corr = combined.iloc[:, 0].corr(combined.iloc[:, 1])
+            if abs(corr) >= correlation_threshold:
+                skip = True
+                break
+
+        if skip:
+            continue
+
+        selected_stocks.append(stock)
+        selected_sectors.add(sector)
+
+        if len(selected_stocks) >= top_n:
+            break
+
+    print("Selected stocks:", selected_stocks)
+
+    # --------------------------
+    # Prepare final DataFrame
+    # --------------------------
+    final_stocks = ranked_stocks[ranked_stocks['tradingsymbol'].isin(selected_stocks)]
+    top_stocks = final_stocks[['tradingsymbol', 'score', 'sector', 'latest_close']].copy()
+    top_stocks['score'] = top_stocks['score'].round(2)
+    top_stocks['latest_close'] = top_stocks['latest_close'].round(2)
+    top_stocks['Date_Update'] = datetime.now().date()
+
+    # --------------------------
+    # Write to Gold Delta table
+    # --------------------------
+    spark_df = spark.createDataFrame(top_stocks)
+    gold_table = "stock_catalog.gold.top_stocks"
+
+    spark_df.write.format("delta") \
+        .mode("overwrite") \
+        .saveAsTable(gold_table)
+
+    print(f"✅ Top {len(top_stocks)} stocks written to Gold: {gold_table}")
+    return top_stocks
+
+from pyspark.sql import SparkSession, Window
+from pyspark.sql import functions as F
+
+def create_stock_features_ml(bronze_table="stock_catalog.bronze.stock_timeseries",
+                             silver_table="stock_catalog.silver.stock_features_ml",
+                             momentum_windows=[5,20,60],
+                             volatility_windows=[5,20,60],
+                             min_volume=1000,
+                             target_horizon=5):
+    """
+    Compute ML features and 5-day forward return target from OHLCV bronze table
+    and write to silver table for training/testing.
+    """
+    spark = SparkSession.builder.getOrCreate()
+
+    # Load bronze data
+    df = spark.table(bronze_table)
+    df = df.withColumn("date", F.to_date("date"))
+
+    # --- Stock age features ---
+    w_stock = Window.partitionBy("tradingsymbol").orderBy("date")
+    df = df.withColumn("first_date", F.min("date").over(w_stock))
+    df = df.withColumn("days_since_listing", F.datediff("date", "first_date"))
+    df = df.withColumn("is_new_stock", F.when(F.col("days_since_listing") < 60, 1).otherwise(0))
+
+    # --- Momentum features ---
+    for w in momentum_windows:
+        df = df.withColumn(f"momentum_{w}d", 
+                           (F.col("close") - F.lag("close", w).over(w_stock)) / F.lag("close", w).over(w_stock))
+
+    # --- Volatility features ---
+    for w in volatility_windows:
+        df = df.withColumn(f"volatility_{w}d",
+                           F.stddev("close").over(Window.partitionBy("tradingsymbol")
+                                                  .orderBy("date")
+                                                  .rowsBetween(-w+1, 0)))
+
+    # --- Average volume ---
+    df = df.withColumn("avg_volume_20d",
+                       F.avg("volume").over(Window.partitionBy("tradingsymbol")
+                                             .orderBy("date")
+                                             .rowsBetween(-19, 0)))
+    # Filter illiquid days
+    df = df.filter(F.col("avg_volume_20d") >= min_volume)
+
+    # --- Compute forward return target ---
+    df = df.withColumn("close_future", F.lead("close", target_horizon).over(w_stock))
+    df = df.withColumn("future_5d_return", (F.col("close_future") - F.col("close")) / F.col("close"))
+    df = df.drop("close_future")
+
+    # --- Cross-sectional percentile rank per day ---
+    w_date = Window.partitionBy("date").orderBy(F.col("future_5d_return").desc())
+    df = df.withColumn("future_5d_return_rank",
+                       F.percent_rank().over(w_date))
+
+    # --- Select relevant columns ---
+    feature_cols = ["date", "tradingsymbol", "close", "volume",
+                    "days_since_listing", "is_new_stock"] + \
+                   [f"momentum_{w}d" for w in momentum_windows] + \
+                   [f"volatility_{w}d" for w in volatility_windows] + \
+                   ["avg_volume_20d", "future_5d_return", "future_5d_return_rank"]
+
+    df_features = df.select(*feature_cols)
+
+    # --- Write to silver table ---
+    df_features.write.format("delta") \
+        .mode("overwrite") \
+        .saveAsTable(silver_table)
+
+    print(f"✅ Silver ML table created: {silver_table}")
+
+
+
+def send_pushover_notification(top_stocks, top_n=10):
+    """
+    Sends a Pushover push notification with the top N stocks.
+
+    Parameters:
+    - top_stocks: pandas DataFrame containing at least 'tradingsymbol' column
+    - top_n: number of top stocks to include in message
+    """
+
+    # Format top N stocks as text
+    top_symbols = top_stocks['tradingsymbol'].head(top_n).tolist()
+    top10_str = ", ".join(top_symbols)
+
+    message = f"📈 Top {top_n} Stocks Today:\n{top10_str}"
+    print(pushover_api_token)
+
+    # Send POST request to Pushover API
+    response = requests.post(
+        "https://api.pushover.net/1/messages.json",
+        data={
+            "token": pushover_api_token,
+            "user": pushover_userkey,
+            "message": message,
+            "title": "Daily Stock Signals"
+        }
+    )
+
+    if response.status_code == 200:
+        print(f"✅ Pushover notification sent! Top {top_n} stocks included.")
+    else:
+        print(f"❌ Failed to send Pushover notification. Status code: {response.status_code}")
+
