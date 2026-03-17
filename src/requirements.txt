@@ -1,5 +1,5 @@
 # Data and computation
-numpy==1.27.0
+numpy==1.26.4          # last version compatible with Python 3.10
 pandas==2.1.0
 python-dateutil==2.8.2
 pytz==2023.3
