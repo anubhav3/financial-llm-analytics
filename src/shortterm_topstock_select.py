@@ -10,7 +10,7 @@ CORRELATION_THRESHOLD = 0.6
 TOP_N = 10
 
 # Login to Kite
-subprocess.run([sys.executable, "auto_kite_login.py"], check = True)
+subprocess.run([sys.executable, "src/auto_kite_login.py"], check = True)
 
 
 ## Update the database with latest stocks
