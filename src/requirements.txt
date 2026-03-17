@@ -24,7 +24,7 @@ GoogleNews==1.6.6
 openai==0.27.8   # last version fully compatible with Python 3.10
 
 # Kite Connect (Zerodha)
-kiteconnect==4.3.0  # last version compatible with Python 3.10
+kiteconnect==4.2.0  # last version compatible with Python 3.10
 
 # SQLAlchemy
 SQLAlchemy==2.0.20
