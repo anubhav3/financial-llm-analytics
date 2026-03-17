@@ -8,7 +8,7 @@ phases:
       - pip install -r requirements.txt
   build:
     commands:
-      - python shortterm_topstock_select.py
+      - python src/shortterm_topstock_select.py
 
 artifacts:
   files:
