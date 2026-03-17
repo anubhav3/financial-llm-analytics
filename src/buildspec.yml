@@ -1,0 +1,9 @@
+phases:
+  install:
+    runtime-versions:
+      python: 3.10
+    commands:
+      - pip install -r requirements.txt
+  build:
+    commands:
+      - python shortterm_topstock_select.py
