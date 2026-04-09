@@ -4,14 +4,17 @@
 # Install required packages for Kite login
 import subprocess
 import sys
+import os
 
 PRICE_LIMIT = 200
 CORRELATION_THRESHOLD = 0.6
 TOP_N = 10
 
+# Change to the project directory
+os.chdir("/home/ec2-user/main/financial-llm-analytics")
+
 # Login to Kite
 subprocess.run([sys.executable, "src/auto_kite_login.py"], check = True)
-
 
 ## Update the database with latest stocks
 from utils import database_update
@@ -29,10 +32,16 @@ update_stock_scores_db()
 from utils import classify_new_stocks_to_sectors
 classify_new_stocks_to_sectors()
 
-# Select top stocks based on given criteria
+# # Select top stocks based on given criteria
 from utils import select_top_stocks
 top_stocks = select_top_stocks(top_n = TOP_N, price_limit = PRICE_LIMIT, correlation_threshold = CORRELATION_THRESHOLD)
+print("Top stocks selected:", top_stocks)
 
-## Send push notifications
-from utils import send_pushover_notification
-send_pushover_notification(top_stocks)
+# ## Send push notifications
+from utils import send_email_notification
+send_email_notification(top_stocks)
+
+# # -----------------------------
+# # Shutdown EC2 instance when done
+# # -----------------------------
+# os.system("sudo shutdown -h now")
