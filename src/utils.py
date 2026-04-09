@@ -12,6 +12,7 @@ from datetime import datetime, date, timedelta, time as dt_time
 from pathlib import Path
 import traceback
 import requests
+import boto3
 
 # Third-party libraries
 import numpy as np
@@ -21,7 +22,7 @@ import pytz
 from dateutil.relativedelta import relativedelta
 from dotenv import load_dotenv
 from tqdm import tqdm
-from nltk.sentiment.vader import SentimentIntensityAnalyzer
+# from nltk.sentiment.vader import SentimentIntensityAnalyzer
 from GoogleNews import GoogleNews
 from kite_connect import ZerodhaConnector
 from kiteconnect.exceptions import InputException
@@ -31,8 +32,8 @@ from sqlalchemy import (
 from azure.identity import DefaultAzureCredential
 from azure.keyvault.secrets import SecretClient
 
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import current_timestamp, lit, col
+# from pyspark.sql import SparkSession
+# from pyspark.sql.functions import current_timestamp, lit, col
 
 
 # --------------------------
@@ -42,23 +43,26 @@ project_root = Path.cwd().parent
 env_path = project_root / ".env"
 load_dotenv(dotenv_path=env_path, override=True)
 
-key_vault_url = "https://stocks-zerodha.vault.azure.net/"
-credential = DefaultAzureCredential()
-client = SecretClient(vault_url=key_vault_url, credential=credential)
+session = boto3.session.Session()
+client = session.client(service_name='secretsmanager',
+                        region_name="eu-north-1" )
+secrets = client.get_secret_value(SecretId='StockZerodhaRelated')['SecretString']
+secrets = eval(secrets)
 
-DB_USER = client.get_secret("POSTGRES-AZURE-USER").value
-DB_PASSWORD = client.get_secret("POSTGRES-AZURE-PASSWORD").value
+DB_USER = None
+DB_PASSWORD = None
 DB_SERVER = "databricks-zerodha"
 DB_HOST = "databricks-zerodha.postgres.database.azure.com"
 DB_PORT = "5432"
 DB_NAME = "market"
-OPENAI_API_KEY = client.get_secret("OPENAI-API-KEY").value
-API_KEY = client.get_secret("KITE-API-KEY").value
-API_SECRET = client.get_secret("KITE-API-SECRET").value
+OPENAI_API_KEY = secrets['OPENAI-API-KEY']
+API_KEY = secrets['KITE-API-KEY']
+API_SECRET = secrets['KITE-API-SECRET']
 ACCESS_TOKEN = os.getenv("KITE-ACCESS-TOKEN", None)
 client_openai = OpenAI(api_key=OPENAI_API_KEY)
-pushover_api_token = client.get_secret("pushover-api-token").value
-pushover_userkey = client.get_secret("pushover-userkey").value
+pushover_api_token = secrets['PUSHOVER-API-TOKEN']
+pushover_userkey = secrets['PUSHOVER-USER-KEY']
+BUCKET = "stockzerodha"
 
 # --------------------------
 # Database connection
@@ -150,7 +154,6 @@ def get_instrument_token(symbol, exchange="NSE"):
 # ---- Function to fetch OHLCV ----
 def fetch_ohlcv_from_zerodha(symbol, from_date, to_date, interval, exchange, kite):
     token = get_instrument_token(symbol, exchange)
-    
     data = kite.historical_data(
         instrument_token=token,
         from_date=from_date,
@@ -493,8 +496,9 @@ def process_and_store_intended_orders(top_stocks, amo_flag=True):
 # --------------------------
 def database_update():
     """
-    Fetch latest stock list from Kite API and write to Bronze Delta table in Unity Catalog
+    Fetch latest stock list from Kite API and write to Bronze layer in S3 (Parquet)
     """
+
     # -----------------------------
     # 1. Fetch stock data from Kite API
     # -----------------------------
@@ -510,59 +514,69 @@ def database_update():
     df['date_update'] = datetime.now().date()
 
     # Select relevant columns
-    cols_sel = ['date_update', 'instrument_token', 'exchange_token', 'tradingsymbol',
-                'name', 'instrument_type', 'segment', 'exchange']
+    cols_sel = [
+        'date_update', 'instrument_token', 'exchange_token',
+        'tradingsymbol', 'name', 'instrument_type',
+        'segment', 'exchange'
+    ]
     df = df[cols_sel]
 
     # -----------------------------
-    # 2. Convert to Spark DataFrame
+    # 2. Save locally as Parquet
     # -----------------------------
-    spark_df = SparkSession.builder.getOrCreate().createDataFrame(df)
-
-    # Optional: add ingestion timestamp for Bronze layer
-    spark_df = spark_df.withColumn("ingestion_ts", current_timestamp())
+    local_file = "/tmp/stock_list.parquet"
+    df.to_parquet(local_file, index=False)
 
     # -----------------------------
-    # 3. Write to Bronze Delta table
+    # 3. Upload to S3 (Bronze layer)
     # -----------------------------
-    bronze_table = "stock_catalog.bronze.stock_list"
+    s3 = boto3.client("s3")
 
-    spark_df.write.format("delta").mode("overwrite").saveAsTable(bronze_table)
+    bucket_name = "stockzerodha"
 
-    print(f"✅ Successfully uploaded stock list to Bronze Delta table: {bronze_table}")
+    s3_key = f"bronze/stock_list.parquet"
+
+    s3.upload_file(local_file, bucket_name, s3_key)
+
+    print(f"✅ Uploaded to S3: s3://{bucket_name}/{s3_key}")
 
 
 def update_stock_timeseries_db():
     """
-    Fetch OHLCV from Zerodha and write raw data to Bronze Delta table,
+    Fetch OHLCV from Zerodha and write raw data to S3 (Bronze layer),
     preserving first-time vs incremental update logic.
     """
-    spark = SparkSession.builder.getOrCreate()
-    
-    # Load stock list from Bronze
-    df_stock_list = spark.table("stock_catalog.bronze.stock_list")
-    stock_list = df_stock_list.toPandas()
-    
+
+    # -----------------------------
+    # Load stock list from S3
+    # -----------------------------
+    stock_list_path = "bronze/stock_list.parquet"
+
+    df_stock_list = pd.read_parquet("s3://" + BUCKET + '/' + stock_list_path, engine="pyarrow")
+
     kite_client = ZerodhaConnector(API_KEY, ACCESS_TOKEN)
     kite = kite_client.kite
 
     to_date = datetime.now().date()
     from_date_default = to_date - relativedelta(months=60)
-
-    bronze_table = "stock_catalog.bronze.stock_timeseries"
+    
 
     # Check if Bronze table exists
     try:
-        df_existing = spark.table(bronze_table)
+        df_existing = pd.read_parquet(
+                            f"s3://{BUCKET}/bronze/stock_timeseries.parquet",
+                            engine="pyarrow"
+                        )
         first_time = False
     except Exception:
         print("⚠️ Bronze stock_timeseries table does not exist. Running full initial load.")
         first_time = True
         df_existing = None
 
-    all_data = []
+    print(df_existing)
+    all_data = df_existing if df_existing is not None else []
 
-    for _, stock in tqdm(stock_list.iterrows(), total=len(stock_list), desc="Updating Stocks"):
+    for _, stock in tqdm(df_stock_list.iterrows(), total=len(df_stock_list), desc="Updating Stocks"):
         symbol = stock['tradingsymbol']
 
         # Determine from_date
@@ -570,34 +584,41 @@ def update_stock_timeseries_db():
             from_date = from_date_default
         else:
             # Check last saved date for this symbol
-            df_symbol = df_existing.filter(col("tradingsymbol") == symbol).select("date")
-            if df_symbol.count() > 0:
-                last_saved = df_symbol.agg({"date": "max"}).collect()[0][0]
+            df_symbol = df_existing[df_existing["tradingsymbol"] == symbol][["date"]]
+            if not df_symbol.empty:
+                last_saved = df_symbol["date"].max()
                 last_saved = last_saved.date() if isinstance(last_saved, datetime) else last_saved
                 if last_saved >= to_date:
-                    # Already up-to-date
                     continue
                 from_date = last_saved + timedelta(days=1)
             else:
                 from_date = from_date_default
 
-        # Fetch raw OHLCV
         df = fetch_ohlcv_from_zerodha(symbol, from_date, to_date, "day", "NSE", kite)
+
         if not df.empty:
             df['tradingsymbol'] = symbol
             df['ingestion_ts'] = datetime.now()
             all_data.append(df)
 
-    # Write to Bronze Delta
+    # -----------------------------
+    # Write to S3 (Bronze layer)
+    # -----------------------------
+    print(all_data)
     if all_data:
         df_combined = pd.concat(all_data, ignore_index=True)
-        spark_df = spark.createDataFrame(df_combined)
 
-        spark_df.write.format("delta") \
-            .mode("append") \
-            .saveAsTable(bronze_table)
+        local_file = "/tmp/stock_timeseries.parquet"
+        df_combined.to_parquet(local_file, index=False)
+    
+        s3 = boto3.client("s3")
 
-        print(f"✅ Successfully updated Bronze stock_timeseries: {bronze_table}")
+        s3_key = f"bronze/stock_timeseries.parquet"
+
+        s3.upload_file(local_file, BUCKET, s3_key)
+
+        print(f"✅ Successfully updated Bronze stock_timeseries: s3://{BUCKET}/{s3_key}")
+
     else:
         print("ℹ️ No new data to update.")
 
@@ -605,38 +626,52 @@ def update_stock_scores_db():
     """
     Compute stock scores from Bronze tables and write to Silver Delta table
     """
-    spark = SparkSession.builder.getOrCreate()
     to_date = datetime.now().date()
 
     # -----------------------------
-    # 1. Load stock list from Bronze
+    # 1. Load stock list
     # -----------------------------
-    df_stock_list = spark.table("stock_catalog.bronze.stock_list").toPandas()
+    stock_list_path = "bronze/stock_list.parquet"
+    df_stock_list = pd.read_parquet(
+        f"s3://{BUCKET}/{stock_list_path}",
+        engine="pyarrow"
+    )
+
     if df_stock_list.empty:
         print("⚠️ No stocks found in stock_list.")
+        return
+
+    # -----------------------------
+    # 2. Load full time series ONCE
+    # -----------------------------
+    df_ts_all = pd.read_parquet(
+        f"s3://{BUCKET}/bronze/stock_timeseries.parquet",
+        engine="pyarrow"
+    )
+
+    if df_ts_all.empty:
+        print("⚠️ No time series data found.")
         return
 
     results = []
 
     # -----------------------------
-    # 2. Loop over each stock
+    # 3. Process each stock via groupby
     # -----------------------------
-    for _, stock in tqdm(df_stock_list.iterrows(), total=len(df_stock_list), desc="Scoring Stocks"):
-        symbol = stock['tradingsymbol']
+    for symbol, df_ts in tqdm(df_ts_all.groupby("tradingsymbol"), desc="Scoring Stocks"):
+        
+        df_ts = df_ts.sort_values("date")
 
-        # Load full OHLCV history from Bronze
-        df_ts = spark.table("stock_catalog.bronze.stock_timeseries") \
-                     .filter(col("tradingsymbol") == symbol) \
-                     .orderBy("date") \
-                     .toPandas()
-
-        if df_ts.empty or len(df_ts) < 2:
+        if len(df_ts) < 2:
             continue
 
-        # Compute technical indicators
+        # Compute indicators
         df_indicators = compute_indicators(df_ts)
 
-        # Take latest row for scoring
+        if df_indicators.empty:
+            continue
+
+        # Take latest row
         latest_row = df_indicators.iloc[-1]
 
         # Compute score
@@ -650,22 +685,17 @@ def update_stock_scores_db():
         })
 
     # -----------------------------
-    # 3. Write results to Silver Delta
+    # 4. Write to Silver
     # -----------------------------
     if results:
         df_scores = pd.DataFrame(results)
-        spark_df = spark.createDataFrame(df_scores)
 
-        silver_table = "stock_catalog.silver.stock_scores"
+        output_path = f"s3://{BUCKET}/silver/stock_scores.parquet"
+        df_scores.to_parquet(output_path, engine="pyarrow", index=False)
 
-        spark_df.write.format("delta") \
-            .mode("append") \
-            .saveAsTable(silver_table)
-
-        print(f"✅ Saved {len(df_scores)} stock scores to Silver: {silver_table}")
+        print(f"✅ Saved {len(df_scores)} stock scores to: {output_path}")
     else:
         print("⚠️ No scores calculated.")
-
 
 # --------------------------
 # Incremental stock sector classification
@@ -684,13 +714,13 @@ def classify_new_stocks_to_sectors(batch_size: int = 100, allowed_sectors: list 
             "Metals", "Paper", "Plastics", "Real Estate", "Retail", "Rubber", "Shipping", "Technology",
             "Telecommunications", "Textiles", "Trading"
         ]
-
-    spark = SparkSession.builder.getOrCreate()
     
     # -----------------------------
     # 1. Load stock list from Bronze
     # -----------------------------
-    df_stock_list = spark.table("stock_catalog.bronze.stock_list").toPandas()
+    stock_list_path = "bronze/stock_list.parquet"
+    df_stock_list = pd.read_parquet("s3://" + BUCKET + '/' + stock_list_path, engine="pyarrow")
+    
     if df_stock_list.empty:
         print("⚠️ No stocks found in stock_list.")
         return pd.DataFrame()
@@ -699,7 +729,11 @@ def classify_new_stocks_to_sectors(batch_size: int = 100, allowed_sectors: list 
     # 2. Load existing sectors from Silver
     # -----------------------------
     try:
-        df_existing = spark.table("stock_catalog.silver.stock_sectors").toPandas()
+        stock_list_path = "silver/stock_sectors.parquet"
+        df_existing = pd.read_parquet(
+                            f"s3://{BUCKET}/{stock_list_path}",
+                            engine="pyarrow"
+                        )
         existing_symbols = set(df_existing['tradingsymbol'].tolist())
     except Exception:
         existing_symbols = set()
@@ -773,14 +807,11 @@ Stocks:
         # -----------------------------
         # 6. Write to Silver Delta
         # -----------------------------
-        spark_df = spark.createDataFrame(df_sectors)
-        silver_table = "stock_catalog.silver.stock_sectors"
+        output_path = f"s3://{BUCKET}/silver/stock_sectors.parquet"
+        df_sectors.to_parquet(output_path, engine="pyarrow", index=False)
 
-        spark_df.write.format("delta") \
-            .mode("append") \
-            .saveAsTable(silver_table)
 
-        print(f"✅ Classified and uploaded {len(df_sectors)} new stocks to Silver: {silver_table}")
+        print(f"✅ Classified and uploaded {len(df_sectors)} new stocks to Silver: stock_sectors.parquet")
         return df_sectors
     else:
         print("⚠️ No sectors classified.")
@@ -792,14 +823,14 @@ def select_top_stocks(top_n=10, price_limit=200, correlation_threshold=0.6):
     Select top stocks based on score, sector diversification, price limit, and correlation filter.
     Writes final selection to Gold Delta table.
     """
-    spark = SparkSession.builder.getOrCreate()
 
     # --------------------------
     # Load data from Bronze / Silver
     # --------------------------
-    stock_list = spark.table("stock_catalog.bronze.stock_list").toPandas()
-    df_sectors = spark.table("stock_catalog.silver.stock_sectors").toPandas()
-    ranked_stocks = spark.table("stock_catalog.silver.stock_scores").toPandas()
+
+    stock_list = pd.read_parquet("s3://" + BUCKET + '/' + "bronze/stock_list.parquet", engine="pyarrow")
+    df_sectors = pd.read_parquet("s3://" + BUCKET + '/' + "silver/stock_sectors.parquet", engine="pyarrow")
+    ranked_stocks = pd.read_parquet("s3://" + BUCKET + '/' + "silver/stock_scores.parquet", engine="pyarrow")
 
     # Take latest scores only
     latest_date = ranked_stocks['date_update'].max()
@@ -825,9 +856,8 @@ def select_top_stocks(top_n=10, price_limit=200, correlation_threshold=0.6):
         sector = row['sector']
 
         # Load historical closes from Bronze timeseries
-        df_stock = spark.table("stock_catalog.bronze.stock_timeseries") \
-                        .filter(col("tradingsymbol") == stock) \
-                        .toPandas().sort_values("date")
+        df_stock = pd.read_parquet("s3://" + BUCKET + '/' + "bronze/stock_timeseries.parquet", engine="pyarrow")
+        df_stock = df_stock[df_stock['tradingsymbol'] == stock].sort_values("date")
         if df_stock.empty:
             continue
 
@@ -836,9 +866,8 @@ def select_top_stocks(top_n=10, price_limit=200, correlation_threshold=0.6):
 
         # Check correlation with already selected stocks
         for sel_stock in selected_stocks:
-            sel_df = spark.table("stock_catalog.bronze.stock_timeseries") \
-                          .filter(col("tradingsymbol") == sel_stock) \
-                          .toPandas().sort_values("date")
+            sel_df = pd.read_parquet("s3://" + BUCKET + '/' + "bronze/stock_timeseries.parquet", engine="pyarrow")
+            sel_df = sel_df[sel_df['tradingsymbol'] == sel_stock].sort_values("date")
             sel_returns = sel_df['close'].pct_change().dropna()
             combined = pd.concat([stock_returns, sel_returns], axis=1, join='inner')
             if combined.shape[0] == 0:
@@ -871,18 +900,21 @@ def select_top_stocks(top_n=10, price_limit=200, correlation_threshold=0.6):
     # --------------------------
     # Write to Gold Delta table
     # --------------------------
-    spark_df = spark.createDataFrame(top_stocks)
-    gold_table = "stock_catalog.gold.top_stocks"
+    
+    local_file = "/tmp/top_stocks.parquet"
+    top_stocks.to_parquet(local_file, index=False)
 
-    spark_df.write.format("delta") \
-        .mode("overwrite") \
-        .saveAsTable(gold_table)
+    s3 = boto3.client("s3")
 
-    print(f"✅ Top {len(top_stocks)} stocks written to Gold: {gold_table}")
+    s3_key = f"gold/top_stocks.parquet"
+
+    s3.upload_file(local_file, BUCKET, s3_key)
+
+    print(f"✅ Top {len(top_stocks)} stocks written to Gold: top_stocks.parquet")
     return top_stocks
 
-from pyspark.sql import SparkSession, Window
-from pyspark.sql import functions as F
+# from pyspark.sql import SparkSession, Window
+# from pyspark.sql import functions as F
 
 def create_stock_features_ml(bronze_table="stock_catalog.bronze.stock_timeseries",
                              silver_table="stock_catalog.silver.stock_features_ml",
@@ -986,3 +1018,35 @@ def send_pushover_notification(top_stocks, top_n=10):
     else:
         print(f"❌ Failed to send Pushover notification. Status code: {response.status_code}")
 
+
+def send_email_notification(top_stocks, top_n=10):
+    """
+    Sends an email notification with the top N stocks.
+
+    Parameters:
+    - top_stocks: pandas DataFrame containing at least 'tradingsymbol' column
+    - top_n: number of top stocks to include in message
+    """
+
+    # Format top N stocks as text
+    top_symbols = top_stocks['tradingsymbol'].head(top_n).tolist()
+    top10_str = ", ".join(top_symbols)
+
+    subject = "Daily Stock Signals"
+    body = f"📈 Top {top_n} Stocks Today:\n{top10_str}"
+
+    # Send email using AWS SES
+    ses_client = boto3.client('ses', region_name='eu-north-1')
+    response = ses_client.send_email(
+        Source='anubhaviiser@gmail.com',
+        Destination={'ToAddresses': ['anubhaviiser@gmail.com']},
+        Message={
+            'Subject': {'Data': subject},
+            'Body': {'Text': {'Data': body}}
+        }
+    )
+
+    if response['ResponseMetadata']['HTTPStatusCode'] == 200:
+        print(f"✅ Email notification sent! Top {top_n} stocks included.")
+    else:
+        print(f"❌ Failed to send email notification. Response: {response}")
